@@ -5,72 +5,119 @@ import cv2
 import fitz  # PyMuPDF
 import numpy as np
 
+# ================== RYCHLÉ NASTAVENÍ ==================
+DPI = 220  # rychlý raster (případně 260–300 pro citlivější linky)
+DEBUG_SAVE = True  # ukládá mezivýstupy pro diagnostiku
+SAFE_FALLBACK_MIN = 2000  # když masky čar mají méně než ~2000 px, použije se SAFE režim
+# ======================================================
 
-# ---------- PDF -> RGB image ----------
-def pdf_page_to_image(pdf_path: Path, dpi: int = 400) -> np.ndarray:
+
+# ---------- PDF -> GRAY image (rychlejší než RGB) ----------
+def pdf_page_to_gray(pdf_path: Path, dpi: int = DPI) -> np.ndarray:
     doc = fitz.open(pdf_path)
-    page = doc.load_page(0)
+    page = doc.load_page(0)  # 0 = první strana
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csGRAY)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
     return img
 
 
-# ---------- alignment (registration) using ORB + homography ----------
-def align_images(img_ref: np.ndarray, img_to_align: np.ndarray) -> np.ndarray:
-    """
-    Align `img_to_align` to `img_ref` via ORB features and homography.
-    Returns the warped (aligned) image with the same size as `img_ref`.
-    """
-    gray_ref = cv2.cvtColor(img_ref, cv2.COLOR_BGR2GRAY)
-    gray_align = cv2.cvtColor(img_to_align, cv2.COLOR_BGR2GRAY)
+# ---------- Lehké narovnání stránky (deskew) ----------
+def normalize_page(gray: np.ndarray) -> np.ndarray:
+    g = gray
+    # kontrast čar
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    g = clahe.apply(g)
 
-    # more features -> better robustness on technical drawings
-    orb = cv2.ORB_create(2000)
-    kp1, des1 = orb.detectAndCompute(gray_ref, None)
-    kp2, des2 = orb.detectAndCompute(gray_align, None)
+    edges = cv2.Canny(g, 60, 180)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=400)
+    if lines is None:
+        return gray
 
-    if des1 is None or des2 is None:
-        # not enough features, return original
-        return img_to_align
+    # přibližný úhel k 0°/90°
+    angles = []
+    for rho, theta in lines[:, 0]:
+        deg = theta * 180.0 / np.pi
+        d0 = (deg % 180) - 0
+        d90 = (deg % 180) - 90
+        d = d0 if abs(d0) < abs(d90) else d90
+        angles.append(d)
+    mean_angle = float(np.median(angles))
 
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = matcher.match(des1, des2)
-    if len(matches) < 10:
-        # too few matches for a stable homography
-        return img_to_align
+    # dorovnání jen když je odchylka znatelná
+    if abs(mean_angle) < 0.35:
+        return gray
 
-    matches = sorted(matches, key=lambda m: m.distance)[:500]
+    h, w = gray.shape[:2]
+    M = cv2.getRotationMatrix2D(center=(w / 2, h / 2), angle=mean_angle, scale=1.0)
+    rot = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=255)
+    return rot
 
-    pts_ref = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-    pts_aln = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
 
-    H, _mask = cv2.findHomography(
-        pts_aln, pts_ref, method=cv2.RANSAC, ransacReprojThreshold=5.0
+# ---------- Odstranění rámu (crop), aby posun neovlivňovaly okraje ----------
+def safe_crop(gray: np.ndarray, pad: int = 40) -> np.ndarray:
+    h, w = gray.shape[:2]
+    pad = max(0, min(pad, h // 10, w // 10))
+    return gray[pad : h - pad, pad : w - pad]
+
+
+# ---------- Rychlé zarovnání pouze posunem (dx, dy) přes phase correlation ----------
+def align_images_shift(
+    gray_ref: np.ndarray, gray_to_align: np.ndarray, return_shift: bool = False
+):
+    h, w = gray_ref.shape[:2]
+
+    # downscale pro robustní a rychlý odhad
+    s = 0.25
+    ref_sm = cv2.resize(
+        gray_ref, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA
     )
-    if H is None:
-        return img_to_align
-
-    aligned = cv2.warpPerspective(
-        img_to_align, H, (img_ref.shape[1], img_ref.shape[0]), flags=cv2.INTER_LINEAR
+    aln_sm = cv2.resize(
+        gray_to_align, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA
     )
+
+    # hrany → ignorujeme plochy a šrafy tlačíme dolů
+    ref_e = cv2.Canny(ref_sm, 50, 140)
+    aln_e = cv2.Canny(aln_sm, 50, 140)
+
+    # Hann okno zmenšuje vliv okrajových artefaktů
+    win = cv2.createHanningWindow((ref_e.shape[1], ref_e.shape[0]), cv2.CV_64F)
+    a = (ref_e.astype(np.float32) * win).astype(np.float32)
+    b = (aln_e.astype(np.float32) * win).astype(np.float32)
+
+    # phase correlace vrací (dy, dx) v pořadí (y, x)
+    (shift_yx, _resp) = cv2.phaseCorrelate(a, b)
+    dy_sm, dx_sm = shift_yx[1], shift_yx[0]
+    dx, dy = dx_sm / s, dy_sm / s
+
+    # aplikace na plné rozlišení
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    aligned = cv2.warpAffine(
+        gray_to_align, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=255
+    )
+
+    if return_shift:
+        return aligned, float(dx), float(dy)
     return aligned
 
 
-# ---------- line-art extraction (binary mask of lines only) ----------
+# ---------- Extrakce line-art (čáry) ----------
 def extract_line_mask(
     gray: np.ndarray,
-    block_size: int = 25,  # must be odd; 21–31 works well
-    C: int = 15,
-    canny_lo: int = 50,
-    canny_hi: int = 150,
+    block_size: int = 23,  # menší okno = citlivější
+    C: int = 12,
+    canny_lo: int = 35,  # uvolněné prahy aby „něco“ chytly
+    canny_hi: int = 110,
 ) -> np.ndarray:
-    # strengthen thin lines via local contrast
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    eq = clahe.apply(gray)
+    # lehké odšumění bez ztráty hran
+    blur = cv2.bilateralFilter(gray, 5, 45, 45)
 
-    # adaptive threshold -> dark strokes -> 1
+    # zvýraznit tenké linky (lokální kontrast)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    eq = clahe.apply(blur)
+
+    # adaptivní práh: tmavé čáry -> 1
     bw = cv2.adaptiveThreshold(
         src=eq,
         maxValue=255,
@@ -80,72 +127,139 @@ def extract_line_mask(
         C=C,
     )
 
-    # edges help to preserve very thin vectors
+    # hrany (pro velmi tenké vektory)
     edges = cv2.Canny(eq, canny_lo, canny_hi)
 
     mask = cv2.bitwise_or(bw, edges)
 
-    # light denoise + optional thinning
+    # potlač tečky/šrafy
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
-    mask = cv2.erode(mask, k, iterations=1)
 
     return mask
 
 
-# ---------- compose: lines only (green old on top, red new overwrites) ----------
+# ---------- Kompozice „jen čáry“ ----------
 def compose_lines_only(
-    img_old: np.ndarray, img_new_aligned: np.ndarray
+    gray_old: np.ndarray, gray_new_aligned: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
-    h = min(img_old.shape[0], img_new_aligned.shape[0])
-    w = min(img_old.shape[1], img_new_aligned.shape[1])
-    old = img_old[:h, :w]
-    new = img_new_aligned[:h, :w]
+    h = min(gray_old.shape[0], gray_new_aligned.shape[0])
+    w = min(gray_old.shape[1], gray_new_aligned.shape[1])
+    g_old = gray_old[:h, :w]
+    g_new = gray_new_aligned[:h, :w]
 
-    gray_old = cv2.cvtColor(old, cv2.COLOR_BGR2GRAY)
-    gray_new = cv2.cvtColor(new, cv2.COLOR_BGR2GRAY)
+    old_mask = extract_line_mask(g_old)
+    new_mask = extract_line_mask(g_new)
 
-    old_mask = extract_line_mask(gray_old)
-    new_mask = extract_line_mask(gray_new)
-
-    # white canvas
     canvas = np.full((h, w, 3), 255, dtype=np.uint8)
+    canvas[old_mask > 0] = (0, 255, 0)  # zelená = původní
+    canvas[new_mask > 0] = (0, 0, 255)  # červená = nová (přepisuje)
 
-    # draw old lines green
-    canvas[old_mask > 0] = (0, 255, 0)
-
-    # draw new lines red (overwrite green where both present)
-    canvas[new_mask > 0] = (0, 0, 255)
-
-    # change metric: XOR of masks
     change_mask = cv2.bitwise_xor(old_mask, new_mask)
-
     return canvas, change_mask
 
 
-# ---------- main entry ----------
+# ---------- Hlavní běh ----------
 def run_drawdiff(old_pdf: Path, new_pdf: Path, out_dir: Path) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) load first pages
-    img_old = pdf_page_to_image(pdf_path=old_pdf, dpi=400)
-    img_new = pdf_page_to_image(pdf_path=new_pdf, dpi=400)
+    # 1) rychlá rasterizace do gray
+    g_old = pdf_page_to_gray(old_pdf, dpi=DPI)
+    g_new = pdf_page_to_gray(new_pdf, dpi=DPI)
 
-    # 2) align NEW to OLD
-    img_new_aligned = align_images(img_ref=img_old, img_to_align=img_new)
+    # 2) jemný deskew (narovnání)
+    g_old = normalize_page(g_old)
+    g_new = normalize_page(g_new)
 
-    # 3) compose lines-only overlay (green old, red new overwriting)
-    overlay, change_mask = compose_lines_only(
-        img_old=img_old, img_new_aligned=img_new_aligned
+    # 3) crop okrajů (rám neovlivní korelaci)
+    g_old_c = safe_crop(g_old, 40)
+    g_new_c = safe_crop(g_new, 40)
+
+    # 4) odhad posunu na cropech; použij na plné rozlišení
+    _, dx, dy = align_images_shift(g_old_c, g_new_c, return_shift=True)
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    g_new_aln = cv2.warpAffine(
+        g_new,
+        M,
+        (g_new.shape[1], g_new.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderValue=255,
     )
 
-    # 4) save result
+    # 5) DEBUG mezivýstupy
+    if DEBUG_SAVE:
+        cv2.imwrite(str(out_dir / "debug_01_old_gray.png"), g_old)
+        cv2.imwrite(str(out_dir / "debug_02_new_aligned_gray.png"), g_new_aln)
+
+    # 6) Primární masky čar
+    old_mask = extract_line_mask(g_old)
+    new_mask = extract_line_mask(g_new_aln)
+
+    if DEBUG_SAVE:
+        cv2.imwrite(str(out_dir / "debug_03_old_mask.png"), old_mask)
+        cv2.imwrite(str(out_dir / "debug_04_new_mask.png"), new_mask)
+
+    # 7) SAFE fallback – pokud „nevidíme“ téměř žádné čáry
+    need_safe = (cv2.countNonZero(old_mask) < SAFE_FALLBACK_MIN) and (
+        cv2.countNonZero(new_mask) < SAFE_FALLBACK_MIN
+    )
+    if need_safe:
+        SAFE_DPI = 260
+        g_old = pdf_page_to_gray(old_pdf, dpi=SAFE_DPI)
+        g_new = pdf_page_to_gray(new_pdf, dpi=SAFE_DPI)
+
+        # SAFE: bez deskew/crop (zjednodušení, rychlejší)
+        _, dx, dy = align_images_shift(g_old, g_new, return_shift=True)
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        g_new_aln = cv2.warpAffine(
+            g_new,
+            M,
+            (g_new.shape[1], g_new.shape[0]),
+            flags=cv2.INTER_LINEAR,
+            borderValue=255,
+        )
+
+        old_mask = extract_line_mask(
+            g_old, block_size=21, C=10, canny_lo=25, canny_hi=95
+        )
+        new_mask = extract_line_mask(
+            g_new_aln, block_size=21, C=10, canny_lo=25, canny_hi=95
+        )
+
+        if DEBUG_SAVE:
+            cv2.imwrite(str(out_dir / "debug_SAFE_01_old_gray.png"), g_old)
+            cv2.imwrite(str(out_dir / "debug_SAFE_02_new_aligned_gray.png"), g_new_aln)
+            cv2.imwrite(str(out_dir / "debug_SAFE_03_old_mask.png"), old_mask)
+            cv2.imwrite(str(out_dir / "debug_SAFE_04_new_mask.png"), new_mask)
+
+    # 8) Kompozice „jen čáry“
+    h, w = g_old.shape[:2]
+    overlay = np.full((h, w, 3), 255, dtype=np.uint8)
+    overlay[old_mask > 0] = (0, 255, 0)
+    overlay[new_mask > 0] = (0, 0, 255)
+
+    # 9) Debug – hrany pro rychlou vizuální kontrolu
+    if DEBUG_SAVE:
+        cv2.imwrite(str(out_dir / "debug_edges_ref.png"), cv2.Canny(g_old, 50, 140))
+        cv2.imwrite(
+            str(out_dir / "debug_edges_aligned.png"), cv2.Canny(g_new_aln, 50, 140)
+        )
+
+    # 10) Ulož výsledek
     overlay_path = out_dir / "overlay.png"
     cv2.imwrite(str(overlay_path), overlay)
 
+    # úklid paměti mezi joby
+    try:
+        cv2.destroyAllWindows()
+        import gc
+
+        gc.collect()
+    except Exception:
+        pass
+
     return {
-        "summary": "Lines-only diff with alignment "
-        "(green=original on top, red=new overwrites).",
-        "change_pixels": int(np.count_nonzero(change_mask)),
+        "summary": f"FAST lines-only diff (DPI={DPI}, safe_fallback={'ON' if need_safe else 'OFF'}).",
+        "change_pixels": int(np.count_nonzero(cv2.bitwise_xor(old_mask, new_mask))),
         "overlay_path": str(overlay_path),
     }
