@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite
+
+# Virtual env
+venv/
+.env
+.env.*
+
+# Build/Work folders
+work/
+deploy/nssm/
+logs/
+*.pdf
+*.png
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
