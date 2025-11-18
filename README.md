@@ -68,6 +68,20 @@ cd D:\Source\python\DrawDiff\server
 
 ---
 
+🔧 Instalace na nový stroj
+1️⃣ Nainstaluj Python 3.12.x
+
+Stáhneš z oficiálního webu, stačí jedna instalace.
+
+2️⃣ Vytvoř nové virtuální prostředí
+python -m venv venv
+3️⃣ Aktivuj prostředí
+.\venv\Scripts\Activate.ps1
+4️⃣ Nainstaluj knihovny
+pip install -r requirements.txt
+
+Hotovo — systém je připravený ke spuštění.
+
 ## 🧠 Spuštění jako Windows služba (volitelné)
 
 ### 1️⃣ Nainstaluj [NSSM – Non-Sucking Service Manager](https://nssm.cc/download)
