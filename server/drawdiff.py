@@ -168,6 +168,156 @@ def compose_overlay(
 
 
 # -----------------------------------------------------
+# čisté FFT porovnání hran
+# -----------------------------------------------------
+def align_images_shift(
+    gray_ref: np.ndarray,
+    gray_to_align: np.ndarray,
+) -> tuple[float, float]:
+    """
+    Najde posun (dx, dy) mezi dvěma obrázky.
+
+    Princip:
+      - zmenší oba obrázky (rychlejší výpočet)
+      - spočítá hrany (Canny)
+      - použije phaseCorrelate (FFT) nad hranami
+      - vrátí posun přepočtený zpět na původní měřítko
+
+    Výhoda:
+      - funguje i pro obrázky různé velikosti
+      - robustní proti šumu
+      - otestované v původním prototypu
+    """
+
+    h, w = gray_ref.shape
+
+    # měřítko pro zmenšení (rychlost)
+    scale = 0.25
+
+    # zmenšené verze na stejné rozměry
+    ref_sm = cv2.resize(
+        gray_ref,
+        (int(w * scale), int(h * scale)),
+        interpolation=cv2.INTER_AREA,
+    )
+    aln_sm = cv2.resize(
+        gray_to_align,
+        (int(w * scale), int(h * scale)),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    # hrany na zmenšených obrázcích
+    ref_e = cv2.Canny(ref_sm, 50, 140)
+    aln_e = cv2.Canny(aln_sm, 50, 140)
+
+    # Hanning okno proti artefaktům
+    win = cv2.createHanningWindow(
+        (ref_e.shape[1], ref_e.shape[0]),
+        cv2.CV_64F,
+    )
+
+    a = (ref_e.astype(np.float32) * win).astype(np.float32)
+    b = (aln_e.astype(np.float32) * win).astype(np.float32)
+
+    # phase correlation – vrátí (dy, dx) ve škále zmenšeniny
+    (shift_yx, _resp) = cv2.phaseCorrelate(a, b)  # type: ignore
+
+    dy_sm, dx_sm = shift_yx[1], shift_yx[0]
+
+    # přepočet na plné rozlišení
+    dx = float(dx_sm / scale)
+    dy = float(dy_sm / scale)
+
+    return dx, dy
+
+
+# -----------------------------------------------------
+# Rozšíří menší obrázek tak, aby oba obrázky měly stejný rozměr.
+# -----------------------------------------------------
+def pad_to_match(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Rozšíří menší obrázek tak, aby oba obrázky měly stejný rozměr.
+
+    PROBLÉM:
+      - PDF výkresy často nemají stejné rozměry (jiné okraje, tiskové rámečky).
+      - Funkce phaseCorrelate vyžaduje, aby oba obrázky měly shodnou velikost.
+      - Ořezávání většího obrázku je riskantní (hrozí ztráta důležitých dat).
+
+    ŘEŠENÍ:
+      - Spočítáme maximální výšku a šířku.
+      - Vytvoříme nový bílý plátno (255 = bílé pozadí).
+      - Menší obrázek do něj vložíme do levého horního rohu beze změny obsahu.
+      - Nikde neškálujeme ani nedeformujeme — jen doplňujeme bílé pixely.
+
+    Výhody:
+      - Zachováme 100 % původního obsahu obou výkresů.
+      - Získáme dva obrázky se stejnými rozměry → FFT výpočet posunu funguje.
+      - Robustní řešení pro stavební PDF s různými okraji.
+
+    Návratová hodnota:
+      (obrazek_A_padded, obrazek_B_padded)
+    """
+
+    # Získáme největší výšku a šířku, které se musí použít
+    h = max(a.shape[0], b.shape[0])
+    w = max(a.shape[1], b.shape[1])
+
+    def pad(img: np.ndarray) -> np.ndarray:
+        # Nové bílé plátno odpovídající největším rozměrům
+        padded = np.full(
+            (h, w),
+            255,  # bílá výplň
+            dtype=img.dtype,  # typ zůstává stejný (uint8)
+        )
+
+        # Vložení původního obrázku do levého horního rohu
+        padded[: img.shape[0], : img.shape[1]] = img
+        return padded
+
+    return pad(a), pad(b)
+
+
+# -----------------------------------------------------
+# Vypočítá posun v ose X a Y zvlášť.
+# -----------------------------------------------------
+
+
+def axis_projection_shift(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
+    """
+    Vypočítá posun v ose X a Y zvlášť.
+
+    Metoda:
+      - Pro osu X: zprůměruje obraz přes řádky → vznikne 1D signál délky W
+      - Pro osu Y: zprůměruje obraz přes sloupce → vznikne 1D signál délky H
+      - Udělá korelaci mezi signály → najde shift s nejvyšší shodou
+    """
+
+    # Průměr přes řádky (X signál)
+    sig_x_a = np.mean(a, axis=0)
+    sig_x_b = np.mean(b, axis=0)
+
+    # Průměr přes sloupce (Y signál)
+    sig_y_a = np.mean(a, axis=1)
+    sig_y_b = np.mean(b, axis=1)
+
+    # Korelace osy X
+    corr_x = np.correlate(
+        sig_x_a - sig_x_a.mean(), sig_x_b - sig_x_b.mean(), mode="full"
+    )
+
+    dx = corr_x.argmax() - (len(sig_x_a) - 1)
+
+    # Korelace osy Y
+    corr_y = np.correlate(
+        sig_y_a - sig_y_a.mean(), sig_y_b - sig_y_b.mean(), mode="full"
+    )
+
+    dy = corr_y.argmax() - (len(sig_y_a) - 1)
+
+    return float(dx), float(dy)
+
+
+# -----------------------------------------------------
 # Hlavní funkce, kterou volá FastAPI endpoint
 # -----------------------------------------------------
 def run_drawdiff(
@@ -217,9 +367,29 @@ def run_drawdiff(
             g_new,
         )
 
-    # 2) Výpočet masek čar
+    # 2.0) sjednotíme velikost (doplň bílá pole, nic neřežeme)
+    g_old_p, g_new_p = pad_to_match(g_old, g_new)
+
+    # 2.1) Spočítej posun mezi starým a novým výkresem
+    dx, dy = align_images_shift(g_old_p, g_new_p)
+
+    # 2.2) Aplikuj posun na nový výkres
+    M = np.float32([[1, 0, dx], [0, 1, dy]])  # type: ignore
+    g_new_aligned = cv2.warpAffine(
+        g_new,
+        M,  # type: ignore
+        (g_new.shape[1], g_new.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderValue=255,
+    )  # type: ignore
+
+    if DEBUG_SAVE:
+        cv2.imwrite(str(out_dir / "debug_new_aligned.png"), g_new_aligned)
+
+    # 2.3) Výpočet masek čar
+
     old_mask = extract_line_mask(g_old)
-    new_mask = extract_line_mask(g_new)
+    new_mask = extract_line_mask(g_new_aligned)
 
     if DEBUG_SAVE:
         cv2.imwrite(
