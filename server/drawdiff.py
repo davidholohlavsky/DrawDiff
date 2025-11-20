@@ -19,6 +19,7 @@ from typing import Tuple
 import cv2
 import fitz  # PyMuPDF pro čtení PDF
 import numpy as np
+import math
 
 
 # ===================== NASTAVENÍ =====================
@@ -136,12 +137,18 @@ def compose_overlay(
     """
 
     if old_mask.shape != new_mask.shape:
-        # Bez zarovnávání by se to stát nemělo,
-        # ale pro jistotu ořežeme na společný minimální rozměr.
-        h = min(old_mask.shape[0], new_mask.shape[0])
-        w = min(old_mask.shape[1], new_mask.shape[1])
-        old_mask = old_mask[:h, :w]
-        new_mask = new_mask[:h, :w]
+        # Rozdílné rozměry sjednotíme doplněním bílých okrajů, ne ořezem
+        h = max(old_mask.shape[0], new_mask.shape[0])
+        w = max(old_mask.shape[1], new_mask.shape[1])
+
+        def pad(img):
+            canvas = np.full((h, w), 255, dtype=np.uint8)  # pozadí = bílé
+            canvas[: img.shape[0], : img.shape[1]] = img
+            return canvas
+
+        old_mask = pad(old_mask)
+        new_mask = pad(new_mask)
+
     else:
         h, w = old_mask.shape
 
@@ -317,6 +324,484 @@ def axis_projection_shift(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     return float(dx), float(dy)
 
 
+def _run_lengths(
+    values: list[bool],
+) -> list[tuple[bool, int]]:
+    """
+    Z binární řady True/False udělá run-length kódování.
+    Např. [T,T,F,F,F,T] -> [(T,2), (F,3), (T,1)]
+    """
+    if not values:
+        return []
+
+    runs: list[tuple[bool, int]] = []
+    current = values[0]
+    length = 1
+
+    for v in values[1:]:
+        if v == current:
+            length += 1
+        else:
+            runs.append((current, length))
+            current = v
+            length = 1
+
+    runs.append((current, length))
+    return runs
+
+
+def _is_axis_dashdot_pattern(
+    mask: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    samples: int = 400,
+    min_runs: int = 10,
+) -> bool:
+    """
+    Ověří, jestli daný úsek čáry připomíná osu (čárka–tečka).
+    """
+    h, w = mask.shape
+
+    xs = np.linspace(
+        x1,
+        x2,
+        samples,
+    )
+    ys = np.linspace(
+        y1,
+        y2,
+        samples,
+    )
+
+    vals: list[bool] = []
+    for x, y in zip(xs, ys):
+        xi = int(round(x))
+        yi = int(round(y))
+        if 0 <= xi < w and 0 <= yi < h:
+            vals.append(mask[yi, xi] > 0)
+        else:
+            vals.append(False)
+
+    runs = _run_lengths(vals)
+    if not runs:
+        return False
+
+    ones = [length for value, length in runs if value]
+    zeros = [length for value, length in runs if not value]
+
+    if len(ones) < min_runs:
+        return False
+
+    ones_sorted = sorted(ones)
+    k = max(
+        1,
+        len(ones_sorted) // 3,
+    )
+    short = ones_sorted[:k]
+    long = ones_sorted[-k:]
+
+    if not short or not long:
+        return False
+
+    mean_short = sum(short) / len(short)
+    mean_long = sum(long) / len(long)
+
+    if mean_long < mean_short * 3.0:
+        return False
+
+    if len(zeros) < len(ones) / 2:
+        return False
+
+    return True
+
+
+def _cluster_positions(
+    positions: list[float],
+    tol: float = 15.0,
+) -> list[float]:
+    """
+    Sloučí blízké pozice čar do jedné „osy“.
+    """
+    if not positions:
+        return []
+
+    positions_sorted = sorted(positions)
+    clusters: list[list[float]] = []
+    current: list[float] = [positions_sorted[0]]
+
+    for p in positions_sorted[1:]:
+        if abs(p - current[-1]) <= tol:
+            current.append(p)
+        else:
+            clusters.append(current)
+            current = [p]
+
+    clusters.append(current)
+
+    return [float(sum(c) / len(c)) for c in clusters]
+
+
+def detect_axes(
+    mask: np.ndarray,
+    min_line_length: int = 1800,
+    max_line_gap: int = 25,
+) -> tuple[list[float], list[float]]:
+    """
+    Najde pravděpodobné osy (čárka–tečka) v binární masce čar.
+    Přidána filtrace pro přesnější výběr:
+      - povoleny jen úhly 0° ±2° nebo 90° ±2°
+      - čáry kratší než min_line_length se ignorují
+      - osy s rozestupem menším než 400 px se slučují
+    """
+
+    edges = mask
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=90,
+        minLineLength=min_line_length,
+        maxLineGap=max_line_gap,
+    )
+
+    axes_x: list[float] = []
+    axes_y: list[float] = []
+
+    if lines is None:
+        return [], []
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]  # type: ignore[index]
+
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.hypot(dx, dy)
+        if length < min_line_length:
+            continue
+
+        # úhel čáry v stupních
+        angle_deg = math.degrees(math.atan2(dy, dx))
+        angle_abs = abs(angle_deg)
+        if angle_abs > 90:
+            angle_abs = 180 - angle_abs
+
+        is_vertical = 88 <= angle_abs <= 92
+        is_horizontal = -2 <= angle_deg <= 2 or 178 <= angle_deg <= 180
+
+        if not (is_vertical or is_horizontal):
+            continue
+
+        # kontrola patternu čárka–tečka
+        if not _is_axis_dashdot_pattern(mask, x1, y1, x2, y2, samples=600, min_runs=10):
+            continue
+
+        if is_vertical:
+            x_mid = 0.5 * (x1 + x2)
+            axes_x.append(x_mid)
+        elif is_horizontal:
+            y_mid = 0.5 * (y1 + y2)
+            axes_y.append(y_mid)
+
+    # sloučení os, které jsou příliš blízko (např. kóty)
+    axes_x_clustered = _cluster_positions(axes_x, tol=40.0)
+    axes_y_clustered = _cluster_positions(axes_y, tol=40.0)
+
+    # odstranění "kótových" os – ignoruj pokud jsou blíž než 400 px
+    def filter_spacing(values: list[float], min_gap: float = 400.0) -> list[float]:
+        if len(values) < 2:
+            return values
+        filtered = [values[0]]
+        for v in values[1:]:
+            if all(abs(v - f) >= min_gap for f in filtered):
+                filtered.append(v)
+        return filtered
+
+    axes_x_final = filter_spacing(sorted(axes_x_clustered))
+    axes_y_final = filter_spacing(sorted(axes_y_clustered))
+
+    return axes_x_final, axes_y_final
+
+
+def detect_axis_markers(mask: np.ndarray) -> list[tuple[int, int, int]]:
+    """
+    Detekuje kruhové značky (kolečko s číslem osy) na výkrese.
+    Výstup: [(x, y, r)] pro všechny nalezené kruhy.
+    """
+    blurred = cv2.medianBlur(mask, 5)
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=80,
+        param1=100,
+        param2=20,
+        minRadius=15,
+        maxRadius=60,
+    )
+    results = []
+    if circles is not None:
+        circles = np.uint16(np.around(circles))
+        for c in circles[0, :]:  # type: ignore[index]
+            x, y, r = c
+            results.append((int(x), int(y), int(r)))
+    return results
+
+
+def is_dashdot_pattern(mask: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> bool:
+    """
+    Ověří, jestli čára mezi (x1,y1)-(x2,y2) je čerchovaná (čárka-tečka-čárka).
+    """
+    samples = 600
+    xs = np.linspace(x1, x2, samples)
+    ys = np.linspace(y1, y2, samples)
+    h, w = mask.shape
+    vals = []
+    for x, y in zip(xs, ys):
+        xi, yi = int(round(x)), int(round(y))
+        vals.append(0 <= xi < w and 0 <= yi < h and mask[yi, xi] > 0)
+
+    runs = []
+    current, length = vals[0], 1
+    for v in vals[1:]:
+        if v == current:
+            length += 1
+        else:
+            runs.append((current, length))
+            current, length = v, 1
+    runs.append((current, length))
+
+    on_runs = [l for v, l in runs if v]
+    off_runs = [l for v, l in runs if not v]
+    if len(on_runs) < 5 or len(off_runs) < 4:
+        return False
+
+    mean_on = np.mean(on_runs)
+    short_on = [l for l in on_runs if l < mean_on * 0.6]
+    long_on = [l for l in on_runs if l > mean_on * 1.4]
+    if not short_on or not long_on:
+        return False
+    if np.std(off_runs) > np.mean(off_runs) * 0.5:
+        return False
+    return True
+
+
+def detect_axes_with_markers(
+    mask: np.ndarray, debug_dir: Path | None = None
+) -> tuple[list[float], list[float]]:
+    """
+    Detekce os s využitím čerchovaného patternu + koleček na konci.
+    Výsledek se uloží do debug obrázku, pokud je zadán debug_dir.
+    """
+    markers = detect_axis_markers(mask)
+    lines = cv2.HoughLinesP(
+        mask,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=100,
+        minLineLength=1500,
+        maxLineGap=30,
+    )
+    axes_x, axes_y = [], []
+    if lines is None:
+        return [], []
+
+    debug_img = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]  # type: ignore[index]
+        dx, dy = x2 - x1, y2 - y1
+        length = math.hypot(dx, dy)
+        if length < 1500:
+            continue
+        angle_deg = abs(math.degrees(math.atan2(dy, dx)))
+        if angle_deg > 90:
+            angle_deg = 180 - angle_deg
+        is_vertical = 88 <= angle_deg <= 92
+        is_horizontal = angle_deg <= 2 or angle_deg >= 178
+        if not (is_vertical or is_horizontal):
+            continue
+        if not is_dashdot_pattern(mask, x1, y1, x2, y2):
+            continue
+
+        def near_marker(x, y, markers, tol=50):
+            for mx, my, r in markers:
+                if (x - mx) ** 2 + (y - my) ** 2 <= (r + tol) ** 2:
+                    return True
+            return False
+
+        if not (near_marker(x1, y1, markers) or near_marker(x2, y2, markers)):
+            continue
+
+        color = (0, 255, 255) if is_vertical else (255, 255, 0)
+        cv2.line(debug_img, (x1, y1), (x2, y2), color, 1)
+
+        if is_vertical:
+            axes_x.append(0.5 * (x1 + x2))
+        else:
+            axes_y.append(0.5 * (y1 + y2))
+
+    for mx, my, r in markers:
+        cv2.circle(debug_img, (mx, my), r, (0, 0, 255), 1)
+
+    if debug_dir:
+        debug_path = debug_dir / "debug_axes_markers.png"
+        cv2.imwrite(str(debug_path), debug_img)
+
+    return axes_x, axes_y
+
+
+def debug_draw_axes(
+    gray: np.ndarray,
+    axes_x: list[float],
+    axes_y: list[float],
+) -> np.ndarray:
+    """
+    Vykreslí nalezené osy do kopie šedotónového obrázku.
+    """
+    rgb = cv2.cvtColor(
+        gray,
+        cv2.COLOR_GRAY2BGR,
+    )
+    h, w = gray.shape
+
+    for x in axes_x:
+        xi = int(round(x))
+        if 0 <= xi < w:
+            cv2.line(
+                rgb,
+                (xi, 0),
+                (xi, h - 1),
+                (0, 255, 255),
+                1,
+            )
+
+    for y in axes_y:
+        yi = int(round(y))
+        if 0 <= yi < h:
+            cv2.line(
+                rgb,
+                (0, yi),
+                (w - 1, yi),
+                (255, 255, 0),
+                1,
+            )
+
+    return rgb
+
+
+def compute_shift_from_axes(
+    old_axes_x: list[float],
+    old_axes_y: list[float],
+    new_axes_x: list[float],
+    new_axes_y: list[float],
+) -> tuple[float, float]:
+    """
+    Spočítá posun (dx, dy) mezi dvěma sadami os, robustněji než medián.
+    Používá histogram nejčastějších posunů (mode).
+    """
+
+    import numpy as np
+
+    def mode_shift(ref, target, bin_size=5):
+        if not ref or not target:
+            return 0.0
+        diffs = []
+        for r in ref:
+            nearest = min(target, key=lambda t: abs(t - r))
+            diffs.append(nearest - r)
+        if not diffs:
+            return 0.0
+
+        # histogram posunů (zaokrouhlený na bin_size)
+        bins = np.arange(
+            int(min(diffs)) - bin_size,
+            int(max(diffs)) + bin_size,
+            bin_size,
+        )
+        hist, edges = np.histogram(diffs, bins=bins)
+        mode_index = np.argmax(hist)
+        mode_center = 0.5 * (edges[mode_index] + edges[mode_index + 1])
+
+        return float(mode_center)
+
+    dx = mode_shift(old_axes_x, new_axes_x)
+    dy = mode_shift(old_axes_y, new_axes_y)
+
+    return dx, dy
+
+
+def merge_and_autocrop(
+    g_old: np.ndarray, g_new: np.ndarray, dx: float, dy: float
+) -> np.ndarray:
+    """
+    Spojí dva výkresy na společné plátno, posune nový výkres o (dx, dy)
+    a nakonec automaticky ořízne oblast, kde je alespoň jeden pixel jiný než bílý.
+
+
+    Parametry:
+    g_old: původní výkres (šedotón)
+    g_new: nový výkres (šedotón)
+    dx, dy: posun nového výkresu vůči původnímu (v pixelech)
+
+
+    Vrací:
+    Výsledný oříznutý obrázek s oběma výkresy na společném plátně.
+    """
+
+    # Rozměry původních výkresů
+    h_old, w_old = g_old.shape
+    h_new, w_new = g_new.shape
+
+    # Rozšíříme plátno tak, aby se oba výkresy vešly vedle sebe i s posunem
+    margin = 200  # rezerva okolo (pixely)
+    canvas_w = int(max(w_old, w_new + abs(dx)) + margin * 2)
+    canvas_h = int(max(h_old, h_new + abs(dy)) + margin * 2)
+
+    # Vytvoříme bílé plátno pro oba výkresy
+    canvas_old = np.full((canvas_h, canvas_w), 255, dtype=np.uint8)
+    canvas_new = np.full((canvas_h, canvas_w), 255, dtype=np.uint8)
+
+    # Umístíme starý výkres na střed plátna
+    offset_x = margin
+    offset_y = margin
+    canvas_old[offset_y : offset_y + h_old, offset_x : offset_x + w_old] = g_old
+
+    # Posuneme nový výkres o (dx, dy)
+    M = np.float32([[1, 0, dx + offset_x], [0, 1, dy + offset_y]])  # type: ignore[index]
+    cv2.warpAffine(
+        g_new,
+        M,  # type: ignore[index]
+        (canvas_w, canvas_h),
+        canvas_new,
+        borderValue=255,
+        flags=cv2.INTER_LINEAR,
+    )  # type: ignore[index]
+
+    # Sloučíme vrstvy do RGB pro kontrolu
+    overlay = cv2.merge(
+        [
+            canvas_new,  # červený kanál
+            canvas_old,  # zelený kanál
+            np.full_like(canvas_new, 255),  # modrý (bílý podklad)
+        ]
+    )
+
+    # Automatické oříznutí – najdeme oblast, kde nejsou samé bílé pixely
+    gray_overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
+    mask = gray_overlay < 250  # vše, co není úplně bílé
+
+    coords = cv2.findNonZero(mask.astype(np.uint8))
+    if coords is not None:
+        x, y, w, h = cv2.boundingRect(coords)
+        overlay_cropped = overlay[y : y + h, x : x + w]
+    else:
+        overlay_cropped = overlay
+
+    return overlay_cropped
+
+
 # -----------------------------------------------------
 # Hlavní funkce, kterou volá FastAPI endpoint
 # -----------------------------------------------------
@@ -371,25 +856,67 @@ def run_drawdiff(
     g_old_p, g_new_p = pad_to_match(g_old, g_new)
 
     # 2.1) Spočítej posun mezi starým a novým výkresem
-    dx, dy = align_images_shift(g_old_p, g_new_p)
+    # detekce os na obou výkresech
+    axes_old_x, axes_old_y = detect_axes(extract_line_mask(g_old))
+    axes_new_x, axes_new_y = detect_axes(extract_line_mask(g_new))
 
-    # 2.2) Aplikuj posun na nový výkres
+    # výpočet globálního posunu podle os
+    dx, dy = compute_shift_from_axes(
+        axes_old_x,
+        axes_old_y,
+        axes_new_x,
+        axes_new_y,
+    )
+    print(f"Axis-based shift detected: dx={dx:.2f}, dy={dy:.2f}")
+
+    # 2.2) Spojení a automatické oříznutí výkresů na společném plátně
+    overlay_canvas = merge_and_autocrop(
+        g_old,
+        g_new,
+        dx,
+        dy,
+    )
+
+    cv2.imwrite(str(out_dir / "debug_overlay_autocrop.png"), overlay_canvas)
+
+    # 2.3) Aplikuj posun na nový výkres – bez ořezu, zachová plný rozsah
+
+    h_old, w_old = g_old.shape
+    h_new, w_new = g_new.shape
+
+    # Maximální rozměry obou výkresů
+    canvas_w = max(w_old, w_new)
+    canvas_h = max(h_old, h_new)
+
+    # Bílé plátno pro celý rozsah výkresu
+    canvas = np.full((canvas_h, canvas_w), 255, dtype=np.uint8)
+
+    # Matice posunu
     M = np.float32([[1, 0, dx], [0, 1, dy]])  # type: ignore
+
+    # Posuneme nový výkres na širší plátno (bez ztráty dat)
     g_new_aligned = cv2.warpAffine(
         g_new,
         M,  # type: ignore
-        (g_new.shape[1], g_new.shape[0]),
+        (canvas_w, canvas_h),
         flags=cv2.INTER_LINEAR,
         borderValue=255,
     )  # type: ignore
 
+    # Starý výkres vložíme do stejného rozměru (žádný crop)
+    if g_old.shape != (canvas_h, canvas_w):
+        g_old_full = np.full((canvas_h, canvas_w), 255, dtype=np.uint8)
+        g_old_full[:h_old, :w_old] = g_old
+        g_old = g_old_full
+
     if DEBUG_SAVE:
         cv2.imwrite(str(out_dir / "debug_new_aligned.png"), g_new_aligned)
 
-    # 2.3) Výpočet masek čar
+    # 2.4) Výpočet masek čar – nejdřív sjednotíme velikost, ať se nic neořízne
+    g_old_matched, g_new_aligned_matched = pad_to_match(g_old, g_new_aligned)
 
-    old_mask = extract_line_mask(g_old)
-    new_mask = extract_line_mask(g_new_aligned)
+    old_mask = extract_line_mask(g_old_matched)
+    new_mask = extract_line_mask(g_new_aligned_matched)
 
     if DEBUG_SAVE:
         cv2.imwrite(
@@ -400,6 +927,45 @@ def run_drawdiff(
             str(out_dir / "debug_04_new_mask.png"),
             new_mask,
         )
+
+    # 2.5) Debug: detekce os na staré i nové výkresu
+    axes_old_x, axes_old_y = detect_axes_with_markers(old_mask, debug_dir=out_dir)
+    axes_new_x, axes_new_y = detect_axes_with_markers(new_mask, debug_dir=out_dir)
+
+    # Výpočet posunu podle shody os
+    dx, dy = compute_shift_from_axes(
+        axes_old_x,
+        axes_old_y,
+        axes_new_x,
+        axes_new_y,
+    )
+
+    print(f"Axis+marker shift detected: dx={dx:.2f}, dy={dy:.2f}")
+
+    # Debug vizualizace – uloží staré i nové osy s kolečky
+    debug_old_axes = cv2.cvtColor(old_mask, cv2.COLOR_GRAY2BGR)
+    debug_new_axes = cv2.cvtColor(new_mask, cv2.COLOR_GRAY2BGR)
+
+    for x in axes_old_x:
+        cv2.line(
+            debug_old_axes, (int(x), 0), (int(x), old_mask.shape[0]), (0, 255, 0), 1
+        )
+    for y in axes_old_y:
+        cv2.line(
+            debug_old_axes, (0, int(y)), (old_mask.shape[1], int(y)), (0, 255, 0), 1
+        )
+
+    for x in axes_new_x:
+        cv2.line(
+            debug_new_axes, (int(x), 0), (int(x), new_mask.shape[0]), (0, 0, 255), 1
+        )
+    for y in axes_new_y:
+        cv2.line(
+            debug_new_axes, (0, int(y)), (new_mask.shape[1], int(y)), (0, 0, 255), 1
+        )
+
+    cv2.imwrite(str(out_dir / "debug_05_old_axes.png"), debug_old_axes)
+    cv2.imwrite(str(out_dir / "debug_06_new_axes.png"), debug_new_axes)
 
     # 3) Složení overlay obrázku + masky změn
     overlay, change_mask = compose_overlay(
