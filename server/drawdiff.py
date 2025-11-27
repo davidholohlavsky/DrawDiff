@@ -802,6 +802,47 @@ def merge_and_autocrop(
     return overlay_cropped
 
 
+def merge_on_fixed_canvas(
+    g_old: np.ndarray,
+    g_new: np.ndarray,
+) -> np.ndarray:
+    """
+    Položí starý a nový výkres na bílé plátno 3×3 dílků.
+    Každý dílek má velikost max(šířka, výška) z obou výkresů.
+    Bez zarovnávání, bez ořezu.
+
+    - starý výkres jde do prostředního dílku (řádek 1, sloupec 1)
+    - nový výkres jde do dílku (řádek 1, sloupec 2)
+    """
+
+    h_old, w_old = g_old.shape
+    h_new, w_new = g_new.shape
+
+    # jednotná velikost dílku
+    tile_size = max(h_old, w_old, h_new, w_new)
+    canvas_size = tile_size * 3
+
+    # bílé plátno
+    canvas = np.full(
+        (canvas_size, canvas_size),
+        255,
+        dtype=np.uint8,
+    )
+
+    def place(img, row, col):
+        y0 = row * tile_size
+        x0 = col * tile_size
+        h, w = img.shape
+        canvas[y0 : y0 + h, x0 : x0 + w] = img
+
+    # starý výkres doprostřed
+    place(g_old, 1, 1)
+    # nový výkres napravo od něj
+    place(g_new, 1, 2)
+
+    return canvas
+
+
 # -----------------------------------------------------
 # Hlavní funkce, kterou volá FastAPI endpoint
 # -----------------------------------------------------
@@ -809,6 +850,7 @@ def run_drawdiff(
     old_pdf: Path,
     new_pdf: Path,
     out_dir: Path,
+    variant: str = "default",
 ) -> dict:
     """
     Hlavní vstupní bod pro server (FastAPI).
@@ -841,6 +883,14 @@ def run_drawdiff(
         new_pdf,
         dpi=DPI,
     )
+
+    if variant == "fixed":
+        fixed_canvas = merge_on_fixed_canvas(g_old, g_new)
+        cv2.imwrite(str(out_dir / "debug_fixed_canvas.png"), fixed_canvas)
+        return {
+            "summary": "Placed side-by-side on 3x3 fixed canvas (no alignment).",
+            "overlay_path": str(out_dir / "debug_fixed_canvas.png"),
+        }
 
     if DEBUG_SAVE:
         cv2.imwrite(
