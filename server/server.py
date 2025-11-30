@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi import Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -56,7 +56,20 @@ def root():
 
 
 @app.post("/drawdiff", dependencies=[Depends(verify_api_key)])
-async def drawdiff(old: UploadFile = File(...), new: UploadFile = File(...)):
+async def drawdiff(
+    old: UploadFile = File(...),
+    new: UploadFile = File(...),
+    variant: str = Form("default"),
+):
+    """
+    Endpoint pro porovnání výkresů.
+
+    Parametry:
+      - old: původní PDF
+      - new: nové PDF
+      - variant: 'default' = zarovnávání os, 'fixed' = pouze položení na 3×3 plátno
+    """
+
     job_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_") + str(uuid.uuid4())[:8]
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -66,9 +79,12 @@ async def drawdiff(old: UploadFile = File(...), new: UploadFile = File(...)):
     old_path.write_bytes(await old.read())
     new_path.write_bytes(await new.read())
 
-    result = run_drawdiff(old_path, new_path, job_dir)
+    # volání jádra s novým parametrem variant
+    result = run_drawdiff(old_path, new_path, job_dir, variant=variant)
     result["job_id"] = job_id
     result["overlay_url"] = f"/file/overlay/{job_id}"
+    result["variant"] = variant
+
     return JSONResponse(content=result)
 
 
