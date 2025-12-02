@@ -807,38 +807,32 @@ def merge_on_fixed_canvas(
     g_new: np.ndarray,
 ) -> np.ndarray:
     """
-    Položí starý a nový výkres na bílé plátno 3×3 dílků.
-    Každý dílek má velikost max(šířka, výška) z obou výkresů.
-    Bez zarovnávání, bez ořezu.
+    Položí dva výkresy vedle sebe na bílé plátno přesně tak velké,
+    aby se oba vešly bez ořezu.
 
-    - starý výkres jde do prostředního dílku (řádek 1, sloupec 1)
-    - nový výkres jde do dílku (řádek 1, sloupec 2)
+    - starý výkres vlevo
+    - nový výkres vpravo
     """
 
     h_old, w_old = g_old.shape
     h_new, w_new = g_new.shape
 
-    # jednotná velikost dílku
-    tile_size = max(h_old, w_old, h_new, w_new)
-    canvas_size = tile_size * 3
+    # výsledné rozměry plátna
+    canvas_w = w_old + w_new
+    canvas_h = max(h_old, h_new)
 
-    # bílé plátno
+    # vytvoříme bílé plátno
     canvas = np.full(
-        (canvas_size, canvas_size),
+        (canvas_h, canvas_w),
         255,
         dtype=np.uint8,
     )
 
-    def place(img, row, col):
-        y0 = row * tile_size
-        x0 = col * tile_size
-        h, w = img.shape
-        canvas[y0 : y0 + h, x0 : x0 + w] = img
+    # starý výkres vlevo
+    canvas[:h_old, :w_old] = g_old
 
-    # starý výkres doprostřed
-    place(g_old, 1, 1)
-    # nový výkres napravo od něj
-    place(g_new, 1, 2)
+    # nový výkres vpravo (přesně navazuje)
+    canvas[:h_new, w_old : w_old + w_new] = g_new
 
     return canvas
 
