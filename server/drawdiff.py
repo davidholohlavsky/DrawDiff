@@ -807,32 +807,31 @@ def merge_on_fixed_canvas(
     g_new: np.ndarray,
 ) -> np.ndarray:
     """
-    Položí dva výkresy vedle sebe na bílé plátno přesně tak velké,
-    aby se oba vešly bez ořezu.
-
-    - starý výkres vlevo
-    - nový výkres vpravo
+    Položí dva výkresy vedle sebe na barevné plátno.
+    Levý = starý výkres (zeleně)
+    Pravý = nový výkres (červeně)
     """
 
     h_old, w_old = g_old.shape
     h_new, w_new = g_new.shape
 
-    # výsledné rozměry plátna
+    # převod do masek čar
+    old_mask = extract_line_mask(g_old)
+    new_mask = extract_line_mask(g_new)
+
+    # rozměry plátna
     canvas_w = w_old + w_new
     canvas_h = max(h_old, h_new)
 
-    # vytvoříme bílé plátno
-    canvas = np.full(
-        (canvas_h, canvas_w),
-        255,
-        dtype=np.uint8,
-    )
+    # bílé pozadí (RGB)
+    canvas = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
 
-    # starý výkres vlevo
-    canvas[:h_old, :w_old] = g_old
+    # levá polovina – starý výkres (zelený)
+    canvas[:h_old, :w_old][old_mask > 0] = (0, 255, 0)
 
-    # nový výkres vpravo (přesně navazuje)
-    canvas[:h_new, w_old : w_old + w_new] = g_new
+    # pravá polovina – nový výkres (červený)
+    offset_x = w_old
+    canvas[:h_new, offset_x : offset_x + w_new][new_mask > 0] = (0, 0, 255)
 
     return canvas
 
