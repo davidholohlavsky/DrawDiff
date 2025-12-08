@@ -807,38 +807,31 @@ def merge_on_fixed_canvas(
     g_new: np.ndarray,
 ) -> np.ndarray:
     """
-    Položí starý a nový výkres na bílé plátno 3×3 dílků.
-    Každý dílek má velikost max(šířka, výška) z obou výkresů.
-    Bez zarovnávání, bez ořezu.
-
-    - starý výkres jde do prostředního dílku (řádek 1, sloupec 1)
-    - nový výkres jde do dílku (řádek 1, sloupec 2)
+    Položí dva výkresy vedle sebe na barevné plátno.
+    Levý = starý výkres (zeleně)
+    Pravý = nový výkres (červeně)
     """
 
     h_old, w_old = g_old.shape
     h_new, w_new = g_new.shape
 
-    # jednotná velikost dílku
-    tile_size = max(h_old, w_old, h_new, w_new)
-    canvas_size = tile_size * 3
+    # převod do masek čar
+    old_mask = extract_line_mask(g_old)
+    new_mask = extract_line_mask(g_new)
 
-    # bílé plátno
-    canvas = np.full(
-        (canvas_size, canvas_size),
-        255,
-        dtype=np.uint8,
-    )
+    # rozměry plátna
+    canvas_w = w_old + w_new
+    canvas_h = max(h_old, h_new)
 
-    def place(img, row, col):
-        y0 = row * tile_size
-        x0 = col * tile_size
-        h, w = img.shape
-        canvas[y0 : y0 + h, x0 : x0 + w] = img
+    # bílé pozadí (RGB)
+    canvas = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
 
-    # starý výkres doprostřed
-    place(g_old, 1, 1)
-    # nový výkres napravo od něj
-    place(g_new, 1, 2)
+    # levá polovina – starý výkres (zelený)
+    canvas[:h_old, :w_old][old_mask > 0] = (0, 255, 0)
+
+    # pravá polovina – nový výkres (červený)
+    offset_x = w_old
+    canvas[:h_new, offset_x : offset_x + w_new][new_mask > 0] = (0, 0, 255)
 
     return canvas
 
