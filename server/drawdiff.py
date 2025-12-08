@@ -843,7 +843,6 @@ def run_drawdiff(
     old_pdf: Path,
     new_pdf: Path,
     out_dir: Path,
-    variant: str = "default",
 ) -> dict:
     """
     Hlavní vstupní bod pro server (FastAPI).
@@ -877,13 +876,12 @@ def run_drawdiff(
         dpi=DPI,
     )
 
-    if variant == "fixed":
-        fixed_canvas = merge_on_fixed_canvas(g_old, g_new)
-        cv2.imwrite(str(out_dir / "debug_fixed_canvas.png"), fixed_canvas)
-        return {
-            "summary": "Placed side-by-side on 3x3 fixed canvas (no alignment).",
-            "overlay_path": str(out_dir / "debug_fixed_canvas.png"),
-        }
+    fixed_canvas = merge_on_fixed_canvas(g_old, g_new)
+    cv2.imwrite(str(out_dir / "debug_fixed_canvas.png"), fixed_canvas)
+    return {
+        "summary": "Placed side-by-side on 3x3 fixed canvas (no alignment).",
+        "overlay_path": str(out_dir / "debug_fixed_canvas.png"),
+    }
 
     if DEBUG_SAVE:
         cv2.imwrite(

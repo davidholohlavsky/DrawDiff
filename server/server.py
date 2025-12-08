@@ -59,7 +59,6 @@ def root():
 async def drawdiff(
     old: UploadFile = File(...),
     new: UploadFile = File(...),
-    variant: str = Form("default"),
 ):
     """
     Endpoint pro porovnání výkresů.
@@ -80,10 +79,9 @@ async def drawdiff(
     new_path.write_bytes(await new.read())
 
     # volání jádra s novým parametrem variant
-    result = run_drawdiff(old_path, new_path, job_dir, variant=variant)
+    result = run_drawdiff(old_path, new_path, job_dir)
     result["job_id"] = job_id
     result["overlay_url"] = f"/file/overlay/{job_id}"
-    result["variant"] = variant
 
     return JSONResponse(content=result)
 
