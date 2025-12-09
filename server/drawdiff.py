@@ -878,6 +878,71 @@ def run_drawdiff(
 
     fixed_canvas = merge_on_fixed_canvas(g_old, g_new)
     cv2.imwrite(str(out_dir / "debug_fixed_canvas.png"), fixed_canvas)
+
+    # --- DETEKCE OS (debugovací krok pro kontrolu) ---
+    if DEBUG_SAVE:
+        # Masky čar
+        old_mask = extract_line_mask(g_old)
+        new_mask = extract_line_mask(g_new)
+
+        # Detekce os na obou výkresech
+        axes_old_x, axes_old_y = detect_axes_with_markers(old_mask, debug_dir=out_dir)
+        axes_new_x, axes_new_y = detect_axes_with_markers(new_mask, debug_dir=out_dir)
+
+        # Konverze do barevných obrázků
+        debug_old_axes = cv2.cvtColor(g_old, cv2.COLOR_GRAY2BGR)
+        debug_new_axes = cv2.cvtColor(g_new, cv2.COLOR_GRAY2BGR)
+
+        # Nastavení barvy (oranžová v BGR)
+        axis_color = (0, 165, 255)  # oranžová (BGR)
+        thickness = 3
+
+        # Vykreslení všech os oranžově
+        for x in axes_old_x:
+            cv2.line(
+                debug_old_axes,
+                (int(x), 0),
+                (int(x), old_mask.shape[0]),
+                axis_color,
+                thickness,
+            )
+        for y in axes_old_y:
+            cv2.line(
+                debug_old_axes,
+                (0, int(y)),
+                (old_mask.shape[1], int(y)),
+                axis_color,
+                thickness,
+            )
+
+        for x in axes_new_x:
+            cv2.line(
+                debug_new_axes,
+                (int(x), 0),
+                (int(x), new_mask.shape[0]),
+                axis_color,
+                thickness,
+            )
+        for y in axes_new_y:
+            cv2.line(
+                debug_new_axes,
+                (0, int(y)),
+                (new_mask.shape[1], int(y)),
+                axis_color,
+                thickness,
+            )
+
+        # Uložení výstupů
+        cv2.imwrite(str(out_dir / "debug_axes_old.png"), debug_old_axes)
+        cv2.imwrite(str(out_dir / "debug_axes_new.png"), debug_new_axes)
+
+        print(
+            f"Old drawing axes: {len(axes_old_x)} vertical, {len(axes_old_y)} horizontal"
+        )
+        print(
+            f"New drawing axes: {len(axes_new_x)} vertical, {len(axes_new_y)} horizontal"
+        )
+
     return {
         "summary": "Placed side-by-side on 3x3 fixed canvas (no alignment).",
         "overlay_path": str(out_dir / "debug_fixed_canvas.png"),
